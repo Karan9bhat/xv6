@@ -6,111 +6,142 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
-#include "pstat.h"
 
-struct {
-  struct spinlock lock;
-  struct proc proc[NPROC];
-  unsigned int timeslice;
-} ptable;
+#define DEFAULT_BUDGET 10
+#define MAXPRIORITY 3
+#define TICKS_TO_PROMOTE 50
 
-// struct proc* q0[NPROC];
-// struct proc* q1[NPROC];
-// struct proc* q2[NPROC];
-// struct proc* q3[NPROC];
-// int index[4] = {-1, -1, -1, -1};
-// int timeslices[4] = {1, 2, 4, 8};
-// struct pstat pstat_var;
-
-static struct proc *initproc;
-
+/**
+ * Logic to maintain the multilevel queue
+ * Modified proc structure holds the next, prev values for the queue
+ */
 typedef struct {
-  struct proc *head;
+  struct proc *head; 
   struct proc *tail;
-}mlfq;
-
+} ProcessQueue;
 
 struct {
-  mlfq levels[3];
-}level_queue;
+  // allocate MAXPRIORITY queues
+  ProcessQueue levels[MAXPRIORITY];
+} priority_queue;
 
-void
-enqueue(struct proc *p) {
+// debugging function
+// prints the queue and does additional fault checking
+// checks if the head incorrectly has a previous value, tail has a next etc.
+void printqueue(ProcessQueue *queue) {
+  struct proc *p = queue->head;
+  if(p) {
+    if(p->prev) {
+      cprintf("prev of head %d is %d\n", p->pid, p->prev->pid);
+      panic("fault in process queue(1.0)");
+    }
+    int encountered_tail = 0;
+    while(p) {
+      cprintf(" -> %d", p->pid);
+      if(p == queue->tail) {
+        if(p->next) {
+          panic("fault in process queue(1.1)");
+        }
+        encountered_tail = 1;
+      }
+      if(p->next) {
+        if(p->next->prev != p) {
+          panic("fault in process queue(1.2)");
+        }
+      }
+      p = p->next;
+    }
+    if(queue->tail && !encountered_tail) {
+      panic("fault in process queue(1.3)");
+    }
+  }
+  cprintf("\n");
+}
+/** pushes a process onto the queue of it's priority */
+void push(struct proc *p) {
   if(p->priority < 0) {
-    panic("Queue error");
+    panic("fault in process queue(2.0)");
   }
   if(p->inqueue) {
-    panic("Queue error");
+    panic("fault in process queue(2.1)");
   }
-  mlfq *q = level_queue.levels + p->priority;
-  if(!q->head) {
-    q->head = p;
+  ProcessQueue *queue = priority_queue.levels + p->priority;
+  if(!queue->head) { // 0 items
+    queue->head = p;
     p->prev = 0;
-  }
-  else {
-    if(q->tail) {
-      q->tail->next = p;
-      p->prev = q->tail;
-    }
-    else {
-      if(q->head->next) {
-        panic("Queue fault");
+  } else {
+    if(queue->tail) { // 1+ items
+      queue->tail->next = p;
+      p->prev = queue->tail;
+    } else { // 1 item
+      if(queue->head->next) {
+        panic("fault in process queue(2.2)");
       }
-      q->head->next = p;
-      p->prev = q->head;
+      queue->head->next = p;
+      p->prev = queue->head;
     }
-    q->tail = p;
+    queue->tail = p;
   }
   p->next = 0;
   p->inqueue = 1;
-  if(q->head && q->head->prev) {
-    panic("Error queue 1");
+  // additional checks, commented for efficiency
+  /*if(queue->head && queue->head->prev) {
+    panic("fault in process queue(2.3)");
   }
-  if(q->tail && q->tail->next) {
-    panic("Error queue 2");
-  }
+  if(queue->tail && queue->tail->next) {
+    panic("fault in process queue(2.4)");
+  }*/
 }
-
-void
-dequeue(struct proc *p) {
+// remove a process from its queue
+void remove(struct proc *p) {
   if(p->priority < 0) {
-    panic("Fault queue");
+    panic("fault in process queue(3.0)");
   }
-  mlfq *q = level_queue.levels + p->priority;
-  if(p == q->head) {
-    q->head = p->next;
+  int priority = p->priority;
+  ProcessQueue *queue = priority_queue.levels + priority;
+  if(p == queue->head) {
+    queue->head = p->next;
     if(p->next) {
       p->next->prev = 0;
     }
-  }
-  else if(p == q->tail) {
-    q->tail = p->prev;
-    q->tail->next = 0;
-  }
-  else {
+  } else if(p == queue->tail) {
+    queue->tail = p->prev;
+    queue->tail->next = 0;
+  } else {
     p->prev->next = p->next;
     p->next->prev = p->prev;
+  }
+  if(queue->head == queue->tail) {
+    queue->tail = 0;
   }
   p->inqueue = 0;
   p->next = 0;
   p->prev = 0;
 }
-
-void
-setrunnable(struct proc *p) {
+// set the process as runnable
+// adds it to the required queue if necessary
+void setrunnable(struct proc *p) {
   p->state = RUNNABLE;
   if(p->priority < 0) {
-    p->priority = 2;
+    p->priority = MAXPRIORITY-1;
   }
   if(!p->inqueue) {
-    enqueue(p);
+    push(p);
+    //cprintf("added %d to queue (%d): ", p->pid, p->priority); printqueue(priority_queue.levels + p->priority);
   }
 }
-
-uint
-getticks() {
+// small wrapper function to get ticks
+uint getticks() {
   return ticks;
 }
+
+struct {
+  struct spinlock lock;
+  struct proc proc[NPROC];
+  unsigned int promote_at_time;
+} ptable;
+
+static struct proc *initproc;
 
 int nextpid = 1;
 extern void forkret(void);
@@ -175,47 +206,26 @@ allocproc(void)
   char *sp;
 
   acquire(&ptable.lock);
-
-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+  int i = 0;
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
     if(p->state == UNUSED)
       goto found;
-
-  // p->priority = 0;
-  // p->clicks = 0;
-  // index[0]++;
-  // q0[index[0]] = p;
-  // pstat_var.inuse[p->pid] = 1;
-  // pstat_var.priority[p->pid] = p->priority;
-  // pstat_var.ticks[p->pid][0] = 0;
-  // pstat_var.ticks[p->pid][1] = 0;
-  // pstat_var.ticks[p->pid][2] = 0;
-  // pstat_var.ticks[p->pid][3] = 0;
-  // pstat_var.pid[p->pid] = p->pid;
+    i+= 1;
+  }
+    
   release(&ptable.lock);
   return 0;
 
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
-
-  // p->priority = 0;
-  // p->clicks = 0;
-  // index[0]++;
-  // q0[index[0]] = p;
-  // pstat_var.inuse[p->pid] = 1;
-  // pstat_var.priority[p->pid] = p->priority;
-  // pstat_var.ticks[p->pid][0] = 0;
-  // pstat_var.ticks[p->pid][1] = 0;
-  // pstat_var.ticks[p->pid][2] = 0;
-  // pstat_var.ticks[p->pid][3] = 0;
-  // pstat_var.pid[p->pid] = p->pid;
-
-  p->clicks = 10;
-  p->priority = 2;
+  p->budget = DEFAULT_BUDGET;
+  p->priority = MAXPRIORITY-1;
   p->inqueue = 0;
   p->next = 0;
   p->prev = 0;
-  
+  //push(p, priority_queue.levels + MAXPRIORITY-1); // add to high priority queue
+
   release(&ptable.lock);
 
   // Allocate kernel stack.
@@ -241,12 +251,9 @@ found:
 
   return p;
 }
-
-void
-update_time(void) {
-  ptable.timeslice = getticks() + 50;
+void updatepromotiontime(void) {
+  ptable.promote_at_time = getticks() + TICKS_TO_PROMOTE;
 }
-
 //PAGEBREAK: 32
 // Set up first user process.
 void
@@ -280,8 +287,7 @@ userinit(void)
   // because the assignment might not be atomic.
   acquire(&ptable.lock);
 
-  // p->state = RUNNABLE;
-  update_time();
+  updatepromotiontime();
   setrunnable(p);
 
   release(&ptable.lock);
@@ -348,7 +354,6 @@ fork(void)
 
   acquire(&ptable.lock);
 
-  // np->state = RUNNABLE;
   setrunnable(np);
 
   release(&ptable.lock);
@@ -454,44 +459,12 @@ wait(void)
 //  - swtch to start running that process
 //  - eventually that process transfers control
 //      via swtch back to the scheduler.
-
-// void
-// tail(struct proc** q, struct proc* p, int *c) {
-//   *q[*c] = *p;
-//   (*c)++;
-// }
-
-// void
-// head(int* q, int pid, int *c) {
-//   for(int i = *c; i > 0; i++) {
-//     q[i] = q[i-1];
-//   }
-//   q[0] = pid;
-//   (*c)++;
-// }
-
-// struct proc*
-// next(int *q, int *c) {
-//   struct proc* p = 0;
-//   int pid;
-//   for(int i = 0; i < *c; i++) {
-//     pid = q[i];
-//     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
-//       if(p->pid == pid && p->state == RUNNABLE) {
-//         return p;
-//       }
-//     }
-//   }
-//   return p;
-// }
-
-
 void
 scheduler(void)
 {
-  struct proc *p, *next, *prev;
+  struct proc *p, *next, *tail;
   struct cpu *c = mycpu();
-  int newindex;
+  int idx = 0, newidx;
   uint startticks;
   c->proc = 0;
   
@@ -502,191 +475,73 @@ scheduler(void)
     // Loop over process table looking for process to run.
     acquire(&ptable.lock);
 
-    if(getticks() > ptable.timeslice) {
-      for(int i = 1; i >= 0; i--) {
-        p = level_queue.levels[i].head;
+    if(getticks() > ptable.promote_at_time) {
+      // promote all processes
+      for(idx = MAXPRIORITY-2;idx >= 0;idx--) {
+        p = priority_queue.levels[idx].head;
         while(p) {
           next = p->next;
           if(p->state == RUNNABLE) {
-            dequeue(p);
-            p->priority = p->priority + 1;
-            enqueue(p);
+            remove(p);
+            p->priority = p->priority+1;
+            push(p);
           }
           p = next;
         }
       }
-      update_time();
+      updatepromotiontime(); // next promotion time
     }
-
-    for(int i = 2; i>= 0; i--) {
-      p = level_queue.levels[i].head;
-      prev = level_queue.levels[i].tail;
+    
+    for(idx = MAXPRIORITY-1;idx >= 0;idx--) {
+      p = priority_queue.levels[idx].head;
+      tail = priority_queue.levels[idx].tail;
       while(p) {
-        next = p->next;
+        next = p->next; // cache the next process
         if(p->state != RUNNABLE) {
-          ;
-        }
-        else {
-          startticks = getticks();
+          // ignore if not runnable
+        } else {
+          //cprintf("start exec of pid=%d: ", p->pid);
+          //printqueue(priority_queue.levels + idx);
+          startticks = getticks(); // start ticks
+          // Switch to chosen process.  It is the process's job
+          // to release ptable.lock and then reacquire it
+          // before jumping back to us.
           c->proc = p;
           switchuvm(p);
           p->state = RUNNING;
+
           swtch(&(c->scheduler), p->context);
           switchkvm();
+          // Process is done running for now.
+          // It should have changed its p->state before coming back.
+
           c->proc = 0;
-          p->clicks -= (getticks() - startticks);
-          dequeue(p);
-          if(p->clicks <= 0) {
-            p->clicks = 50;
-            newindex = (i > 0 ? i - 1 : 0);
-          }
-          else {
-            newindex = i;
-          }
-          p->priority = newindex;
+          // update the budget
+          p->budget -= (getticks() - startticks);
+          //cprintf("pid %d budget %d\n", p->pid, p->budget);
+          //cprintf("removing %d from (%d): ", p->pid, idx); printqueue(priority_queue.levels + idx);
+          remove(p); // remove the process from the queue
+          if(p->budget <= 0) { // if process has used it's budget
+            // reset budget
+            p->budget = DEFAULT_BUDGET;
+            // demote process
+            newidx = (idx > 0 ? idx - 1 : 0);
+          } else newidx = idx; // push back on same queue if budget left
+
+          p->priority = newidx;
           if(p->state == RUNNABLE) {
-            setrunnable(p);
+            setrunnable(p); // run the process again if runnable
           }
+          // if the process isn't runnable -- then some other mechanism will add it to the queue
+          //cprintf("added %d to (%d): ", p->pid, newidx); printqueue(priority_queue.levels + newidx);
         }
-        if(p == prev) {
+        if(p == tail) {
           break;
         }
         p = next;
       }
     }
     release(&ptable.lock);
-
-    // for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-    //   if(p->state != RUNNABLE)
-    //     continue;
-
-    // if(index[0] != -1) {
-    //   for(int i = 0; i <= index[0]; i++) {
-    //     if(q0[i]->state != RUNNABLE) {
-    //       continue;
-    //     }
-    //     p = q0[i];
-    //     curproc = q0[i];
-    //     p->clicks++;
-    //     switchuvm(p);
-    //     p->state = RUNNING;
-    //     swtch(&c->scheduler, p->context);
-    //     switchkvm();
-    //     pstat_var.ticks[p->pid][0] = p->clicks;
-    //     if(p->clicks == timeslices[0]) {
-    //       index[1]++;
-    //       curproc->priority = curproc->priority + 1;
-    //       pstat_var.priority[curproc->pid] = curproc->pid;
-    //       q1[index[1]] = curproc;
-    //       q0[i] = 0;
-    //       for(int j = 0; j <= index[0]-1; j++) {
-    //         q0[j] = q0[j+1];
-    //       }
-    //       q0[index[0]] = 0;
-    //       curproc->clicks = 0;
-    //       index[0]--;
-    //     }
-    //     c->proc = 0;
-    //   }
-    // }
-    // if(index[1] != -1) {
-    //   for(int i = 0; i <= index[1]; i++) {
-    //     if(q1[i]->state != RUNNABLE) {
-    //       continue;
-    //     }
-    //     p = q1[i];
-    //     curproc = q1[i];
-    //     p->clicks++;
-    //     switchuvm(p);
-    //     p->state = RUNNING;
-    //     swtch(&c->scheduler, p->context);
-    //     switchkvm();
-    //     pstat_var.ticks[p->pid][1] = p->clicks;
-    //     if(p->clicks == timeslices[1]) {
-    //       index[2]++;
-    //       curproc->priority = curproc->priority + 1;
-    //       pstat_var.priority[curproc->pid] = curproc->pid;
-    //       q1[index[2]] = curproc;
-    //       q1[i] = 0;
-    //       for(int j = 0; j <= index[1]-1; j++) {
-    //         q1[j] = q1[j+1];
-    //       }
-    //       q1[index[1]] = 0;
-    //       curproc->clicks = 0;
-    //       index[1]--;
-    //     }
-    //     c->proc = 0;
-    //   }
-    // }
-    // if(index[2] != -1) {
-    //   for(int i = 0; i <= index[2]; i++) {
-    //     if(q2[i]->state != RUNNABLE) {
-    //       continue;
-    //     }
-    //     p = q2[i];
-    //     curproc = q2[i];
-    //     p->clicks++;
-    //     switchuvm(p);
-    //     p->state = RUNNING;
-    //     swtch(&c->scheduler, p->context);
-    //     switchkvm();
-    //     pstat_var.ticks[p->pid][2] = p->clicks;
-    //     if(p->clicks == timeslices[2]) {
-    //       index[3]++;
-    //       curproc->priority = curproc->priority + 1;
-    //       pstat_var.priority[curproc->pid] = curproc->pid;
-    //       q1[index[3]] = curproc;
-    //       q0[i] = 0;
-    //       for(int j = 0; j <= index[2]-1; j++) {
-    //         q2[j] = q2[j+1];
-    //       }
-    //       q2[index[2]] = 0;
-    //       curproc->clicks = 0;
-    //       index[2]--;
-    //     }
-    //     c->proc = 0;
-    //   }
-    // }
-    // if(index[3] != -1) {
-    //   for(int i = 0; i <= index[3]; i++) {
-    //     if(q0[i]->state != RUNNABLE) {
-    //       continue;
-    //     }
-    //     p = q3[i];
-    //     curproc = q3[i];
-    //     p->clicks++;
-    //     switchuvm(p);
-    //     p->state = RUNNING;
-    //     swtch(&c->scheduler, p->context);
-    //     switchkvm();
-    //     pstat_var.ticks[p->pid][3] = p->clicks;
-    //     pstat_var.priority[p->pid] = p->priority;
-    //     for(int j = 0; j <= index[3]-1; j++) {
-    //       q3[j] = q3[j+1];
-    //     }
-    //     q3[index[3]] = 0;
-    //     curproc->clicks = 0;
-    //     index[3]--;
-    //     c->proc = 0;
-    //   }
-    // }
-
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
-      // c->proc = p;
-      // switchuvm(p);
-      // p->state = RUNNING;
-
-      // swtch(&(c->scheduler), p->context);
-      // switchkvm();
-
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
-    //   c->proc = 0;
-    // }
-    // release(&ptable.lock);
-
   }
 }
 
@@ -721,7 +576,7 @@ void
 yield(void)
 {
   acquire(&ptable.lock);  //DOC: yieldlock
-  myproc()->state = RUNNABLE;
+  setrunnable(myproc());
   sched();
   release(&ptable.lock);
 }
@@ -795,39 +650,8 @@ wakeup1(void *chan)
   struct proc *p;
 
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
-    if(p->state == SLEEPING && p->chan == chan) {
-      // p->state = RUNNABLE;
+    if(p->state == SLEEPING && p->chan == chan)
       setrunnable(p);
-      // p->clicks = 0;
-      // if(p->priority == 0) {
-      //   index[0]++;
-      //   for(int i = index[0]; i > 0; i--) {
-      //     q0[i] = q0[i-1];
-      //   }
-      //   q0[0] = p;
-      // }
-      // else if(p->priority == 1) {
-      //   index[1]++;
-      //   for(int i = index[1]; i > 0; i--) {
-      //     q1[i] = q1[i-1];
-      //   }
-      //   q1[0] = p;
-      // }
-      // else if(p->priority == 2) {
-      //   index[2]++;
-      //   for(int i = index[2]; i > 0; i--) {
-      //     q2[i] = q2[i-1];
-      //   }
-      //   q2[0] = p;
-      // }
-      // else if(p->priority == 3) {
-      //   index[3]++;
-      //   for(int i = index[3]; i > 0; i--) {
-      //     q3[i] = q3[i-1];
-      //   }
-      //   q3[0] = p;
-      // }
-    }
 }
 
 // Wake up all processes sleeping on chan.
@@ -861,11 +685,9 @@ kill(int pid)
   release(&ptable.lock);
   return -1;
 }
-
-struct proc
-*find(int pid) {
+struct proc *find_by_pid(int pid) {
   struct proc *p;
-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
+  for(p = ptable.proc;p < ptable.proc + NPROC;p++) {
     if(p->pid == pid) {
       if(p->state == UNUSED || p->state == ZOMBIE) {
         break;
@@ -876,37 +698,34 @@ struct proc
   return 0;
 }
 
-int
-setpriority(int pid, int priority) {
-  if(priority < 0 || priority >= 3) {
+int setpriority(int pid, int priority) {
+  if(priority < 0 || priority >= MAXPRIORITY) {
     return -1;
   }
-  acquire(&ptable.lock);
-  int answer = -1;
-  struct proc *p = find(pid);
+  acquire(&ptable.lock); // acquire lock
+  int result = -1;
+  struct proc *p = find_by_pid(pid); // get the process
   if(p) {
-    if(p->inqueue) {
-      dequeue(p);
+    if(p->inqueue) { // remove, if present in some queue
+      remove(p);
     }
-    p->priority = priority;
-    p->clicks = 50;
-    enqueue(p);
-    answer = 0;
+    p->priority = priority; // set new priority
+    p->budget = DEFAULT_BUDGET; // & reset time budget
+    push(p); // update
+    result = 0;
   }
-  release(&ptable.lock);
-  return answer;
+  release(&ptable.lock); 
+  return result;
 }
-
-int
-getpriority(int pid) {
-  int answer = -1;
+int getpriority(int pid) {
+  int result = -1;
   acquire(&ptable.lock);
-  struct proc *p = find(pid);
-  if(p) {
-    answer = p->priority;
-  }
-  release(&ptable.lock);
-  return answer;
+
+  struct proc *p = find_by_pid(pid);
+  if(p) result = p->priority;
+
+  release(&ptable.lock); 
+  return result;
 }
 
 //PAGEBREAK: 36

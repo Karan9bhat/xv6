@@ -34,12 +34,6 @@ struct context {
 
 enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
-// extern struct proc* q0[NPROC];
-// extern struct proc* q1[NPROC];
-// extern struct proc* q2[NPROC];
-// extern struct proc* q3[NPROC];
-// extern int index[4];
-// extern struct pstat pstat_var;
 // Per-process state
 struct proc {
   uint sz;                     // Size of process memory (bytes)
@@ -55,11 +49,12 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
-  int clicks;
-  int priority;
+
+  int budget;                  // time budget left
+  int priority;                // priority of the process (-1 if not in any)
   int inqueue;
-  struct proc *prev;
-  struct proc *next;
+  struct proc *next;           // next process in queue
+  struct proc *prev;           // prev process in queue
 };
 
 // Process memory is laid out contiguously, low addresses first:
